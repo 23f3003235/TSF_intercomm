@@ -170,7 +170,7 @@ def audit(user,action,before,after,department):
 def public_settings():
     result = {k: setting(k, v) for k, v in {
         'factory_name': 'YOUR FACTORY NAME', 'subtitle': 'Internal Telephone Directory',
-        'logo': '', 'theme': 'light', 'font': 'Roboto', 'palette': 'slate',
+        'logo': '', 'theme': 'light', 'theme_style': 'basic', 'font': 'Roboto', 'palette': 'slate',
         'font_size': 'jumbo', 'layout_size': 'jumbo', 'intercom_prefix': '0442652'
     }.items()}
     try:
@@ -224,13 +224,13 @@ def users(user):
         return jsonify([u.public() for u in User.query.order_by(User.name).all()])
 
     d = request.get_json(silent=True) or {}
-    role = str(d.get('role', 'user')).strip()
+    role = str(d.get('role', 'admin')).strip()
     name = str(d.get('name', '')).strip()
     email = str(d.get('email', '')).strip().lower()
     password = str(d.get('password', ''))
     department = str(d.get('department') or '').strip()
-    if role not in ('super_admin', 'admin', 'user'):
-        return jsonify(error='Invalid role'), 400
+    if role not in ('super_admin', 'admin'):
+        return jsonify(error='Only administrator roles can be created'), 400
     if not name or not email or '@' not in email or len(password) < 10:
         return jsonify(error='Name, valid email and password (10+ characters) required'), 400
     if role != 'super_admin' and not department:
@@ -297,10 +297,11 @@ def edit_user(user, uid):
 def settings(user):
  if request.method=='GET':return public_settings()
  d=request.get_json(silent=True) or {}
- for k in ('factory_name','subtitle','logo','theme','font','palette','font_size','layout_size','intercom_prefix'):
+ for k in ('factory_name','subtitle','logo','theme','theme_style','font','palette','font_size','layout_size','intercom_prefix'):
   if k in d:
    value=str(d[k])[:350000] if k=='logo' else str(d[k])[:500]
    if k=='logo' and value and not (value.startswith('https://') or value.startswith('data:image/')):return jsonify(error='Logo must be HTTPS URL or image data'),400
+   if k=='theme_style' and value not in ('basic','studio','signal'):return jsonify(error='Invalid design theme'),400
    if k in ('font_size','layout_size') and value not in ('normal','large','jumbo','extra_jumbo','giant'):return jsonify(error='Invalid display size'),400
    if k=='intercom_prefix' and (not value.isdigit() or len(value)>15):return jsonify(error='Intercom prefix must contain 1–15 digits'),400
    s=db.session.get(Setting,k)
