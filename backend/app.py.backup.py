@@ -1,4 +1,4 @@
-import os, json, smtplib, ssl, threading
+import os, json, smtplib, ssl, threading, re
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from functools import wraps
@@ -75,6 +75,25 @@ def auth(*roles):
 
 def permitted(user,dept):return user.role=='super_admin' or user.department==dept
 
+def readable_contact(raw):
+    """Convert stored JSON snapshots to readable label: value lines."""
+    if not raw:
+        return 'None'
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return str(raw)
+    if not isinstance(data, dict):
+        return str(data)
+    labels = {
+        'name': 'Name', 'unit': 'Unit', 'department': 'Department',
+        'extension': 'Extension', 'designation': 'Designation',
+        'phone': 'Phone', 'id': 'Record ID'
+    }
+    keys = ['name', 'unit', 'department', 'extension', 'designation', 'phone', 'id']
+    return '\n'.join(f'{labels[k]}: {data.get(k) or "—"}' for k in keys if k in data)
+
+
 def notify(audit_id):
     """Notify active super admins of department-admin contact changes."""
     with app.app_context():
@@ -103,12 +122,17 @@ def notify(audit_id):
             f'Contact {record.action.upper()} | {record.actor_email}'
         )
         msg.set_content(
-            f'Admin: {record.actor_name} <{record.actor_email}>\n'
+            f'Administrator: {record.actor_name}\n'
+            f'Administrator Email: {record.actor_email}\n'
             f'Department: {record.department}\n'
-            f'Action: {record.action}\n'
-            f'Time (UTC): {record.time.isoformat()}\n\n'
-            f'BEFORE:\n{record.before or "None"}\n\n'
-            f'AFTER:\n{record.after or "None"}'
+            f'Action: {record.action.capitalize()}\n'
+            f'Date and Time (UTC): {record.time.isoformat()}\n\n'
+            f'Previous Contact Details\n'
+            f'------------------------\n'
+            f'{readable_contact(record.before)}\n\n'
+            f'Updated Contact Details\n'
+            f'-----------------------\n'
+            f'{readable_contact(record.after)}\n'
         )
 
         try:
@@ -132,7 +156,16 @@ def audit(user,action,before,after,department):
  if user.role=='admin':threading.Thread(target=notify,args=(a.id,),daemon=True).start()
 
 @app.get('/api/public/settings')
-def public_settings():return jsonify({k:setting(k,v) for k,v in {'factory_name':'YOUR FACTORY NAME','subtitle':'Internal Telephone Directory','logo':'','theme':'light','font':'Inter','palette':'slate'}.items()})
+def public_settings():
+    result = {k: setting(k, v) for k, v in {
+        'factory_name': 'YOUR FACTORY NAME', 'subtitle': 'Internal Telephone Directory',
+        'logo': '', 'theme': 'light', 'font': 'Inter', 'palette': 'slate'
+    }.items()}
+    try:
+        result['ui_text'] = json.loads(setting('ui_text', '{}'))
+    except (ValueError, TypeError):
+        result['ui_text'] = {}
+    return jsonify(result)
 @app.get('/api/contacts')
 def contacts():
  q=Contact.query
@@ -259,6 +292,13 @@ def settings(user):
    s=db.session.get(Setting,k)
    if s:s.value=value
    else:db.session.add(Setting(key=k,value=value))
+ if 'ui_text' in d:
+  if not isinstance(d['ui_text'], dict):return jsonify(error='Interface text must be a dictionary'),400
+  if len(d['ui_text'])>300:return jsonify(error='Too many text fields'),400
+  cleaned={str(k):str(v)[:300] for k,v in d['ui_text'].items() if re.fullmatch(r'(ui|placeholder)_\d{3}',str(k))}
+  stored=db.session.get(Setting,'ui_text')
+  if stored:stored.value=json.dumps(cleaned,ensure_ascii=False)
+  else:db.session.add(Setting(key='ui_text',value=json.dumps(cleaned,ensure_ascii=False)))
  db.session.commit();return public_settings()
 @app.get('/api/audit')
 @auth('super_admin')

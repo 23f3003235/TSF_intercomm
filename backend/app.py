@@ -159,7 +159,8 @@ def audit(user,action,before,after,department):
 def public_settings():
     result = {k: setting(k, v) for k, v in {
         'factory_name': 'YOUR FACTORY NAME', 'subtitle': 'Internal Telephone Directory',
-        'logo': '', 'theme': 'light', 'font': 'Inter', 'palette': 'slate'
+        'logo': '', 'theme': 'light', 'font': 'Roboto', 'palette': 'slate',
+        'font_size': 'jumbo', 'layout_size': 'jumbo', 'intercom_prefix': '0442652'
     }.items()}
     try:
         result['ui_text'] = json.loads(setting('ui_text', '{}'))
@@ -285,10 +286,12 @@ def edit_user(user, uid):
 def settings(user):
  if request.method=='GET':return public_settings()
  d=request.get_json(silent=True) or {}
- for k in ('factory_name','subtitle','logo','theme','font','palette'):
+ for k in ('factory_name','subtitle','logo','theme','font','palette','font_size','layout_size','intercom_prefix'):
   if k in d:
    value=str(d[k])[:350000] if k=='logo' else str(d[k])[:500]
    if k=='logo' and value and not (value.startswith('https://') or value.startswith('data:image/')):return jsonify(error='Logo must be HTTPS URL or image data'),400
+   if k in ('font_size','layout_size') and value not in ('normal','large','jumbo','extra_jumbo','giant'):return jsonify(error='Invalid display size'),400
+   if k=='intercom_prefix' and (not value.isdigit() or len(value)>15):return jsonify(error='Intercom prefix must contain 1–15 digits'),400
    s=db.session.get(Setting,k)
    if s:s.value=value
    else:db.session.add(Setting(key=k,value=value))
