@@ -1,4 +1,8 @@
-import os, json, smtplib, ssl, threading, re
+import os, json, smtplib, ssl, threading, csv, io
+from collections import defaultdict
+from datetime import timedelta
+from zoneinfo import ZoneInfo
+import re
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from functools import wraps
@@ -36,6 +40,12 @@ class Contact(db.Model):
  designation=db.Column(db.String(120),default='')
  phone=db.Column(db.String(50),default='')
  def public(self): return {k:getattr(self,k) for k in ('id','name','unit','department','extension','designation','phone')}
+class MonthlyReportDelivery(db.Model):
+ month=db.Column(db.String(7),primary_key=True)
+ sent_at=db.Column(db.DateTime)
+ recipients=db.Column(db.Text)
+ status=db.Column(db.String(20),default='pending')
+
 class Setting(db.Model):
  key=db.Column(db.String(60),primary_key=True)
  value=db.Column(db.Text,nullable=False)
@@ -43,6 +53,7 @@ class Audit(db.Model):
  id=db.Column(db.Integer,primary_key=True)
  time=db.Column(db.DateTime,default=lambda:datetime.now(timezone.utc))
  actor_id=db.Column(db.Integer)
+ actor_role=db.Column(db.String(20),default='admin')
  actor_name=db.Column(db.String(120))
  actor_email=db.Column(db.String(200))
  department=db.Column(db.String(100))
@@ -151,7 +162,7 @@ def notify(audit_id):
             db.session.commit()
 
 def audit(user,action,before,after,department):
- a=Audit(actor_id=user.id,actor_name=user.name,actor_email=user.email,department=department,action=action,before=json.dumps(before),after=json.dumps(after),email_status='pending' if user.role=='admin' else 'not_required')
+ a=Audit(actor_role=user.role,actor_id=user.id,actor_name=user.name,actor_email=user.email,department=department,action=action,before=json.dumps(before),after=json.dumps(after),email_status='pending' if user.role=='admin' else 'not_required')
  db.session.add(a);db.session.commit()
  if user.role=='admin':threading.Thread(target=notify,args=(a.id,),daemon=True).start()
 
@@ -307,8 +318,136 @@ def settings(user):
 @auth('super_admin')
 def history(user):return jsonify([a.public() for a in Audit.query.order_by(Audit.id.desc()).limit(300).all()])
 
+
+# Reporting uses local India dates, while the existing audit timestamps are stored as UTC.
+REPORT_TZ=ZoneInfo('Asia/Kolkata')
+ACTION_NAMES={'created':'additions','updated':'updates','deleted':'deletions'}
+
+def admin_audits(department=None, start=None, end=None):
+    q=Audit.query.filter(Audit.action.in_(tuple(ACTION_NAMES)),Audit.actor_role=='admin')
+    if department:q=q.filter(Audit.department==department)
+    if start:q=q.filter(Audit.time>=start)
+    if end:q=q.filter(Audit.time<end)
+    return q.order_by(Audit.time.asc(),Audit.id.asc()).all()
+
+def report_time(a):
+    dt=a.time
+    if dt.tzinfo is None:dt=dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(REPORT_TZ)
+
+def month_range(month):
+    try:
+        year,mon=map(int,month.split('-'))
+        if not 1<=year<=9999 or not 1<=mon<=12:raise ValueError()
+        start=datetime(year,mon,1,tzinfo=REPORT_TZ)
+        stop=datetime(year+1,1,1,tzinfo=REPORT_TZ) if mon==12 else datetime(year,mon+1,1,tzinfo=REPORT_TZ)
+        return start.astimezone(timezone.utc).replace(tzinfo=None),stop.astimezone(timezone.utc).replace(tzinfo=None)
+    except (ValueError,TypeError):raise ValueError('Month must be YYYY-MM')
+
+def summarise(records):
+    def blank():return {'additions':0,'updates':0,'deletions':0,'total':0}
+    totals=blank();groups={k:defaultdict(blank) for k in ('day','week','month','department','admin')}
+    for a in records:
+        dt=report_time(a)
+        iso=dt.isocalendar()
+        keys={'day':dt.strftime('%Y-%m-%d'),'week':f'{iso.year}-W{iso.week:02d}',
+              'month':dt.strftime('%Y-%m'),'department':a.department or 'Unassigned',
+              'admin':a.actor_email or a.actor_name or 'Unknown'}
+        col=ACTION_NAMES[a.action]
+        for obj in (totals,*(groups[k][v] for k,v in keys.items())):
+            obj[col]+=1;obj['total']+=1
+    return {'totals':totals,'groups':{k:[{'label':label,**counts} for label,counts in sorted(g.items())] for k,g in groups.items()}}
+
+@app.get('/api/reports/analytics')
+@auth('super_admin','admin')
+def report_analytics(user):
+    month=request.args.get('month','').strip()
+    if month:
+        try:start,end=month_range(month)
+        except ValueError as e:return jsonify(error=str(e)),400
+    else:start=end=None
+    department=user.department if user.role=='admin' else request.args.get('department','').strip() or None
+    records=admin_audits(department,start,end)
+    result=summarise(records)
+    result.update(month=month or 'all',department=department or 'all',time_zone='Asia/Kolkata')
+    return jsonify(result)
+
+@app.get('/api/reports/changes.csv')
+@auth('super_admin','admin')
+def report_changes_csv(user):
+    month=request.args.get('month','').strip()
+    if month:
+        try:start,end=month_range(month)
+        except ValueError as e:return jsonify(error=str(e)),400
+    else:start=end=None
+    dept=user.department if user.role=='admin' else None
+    output=io.StringIO();writer=csv.writer(output)
+    writer.writerow(['Time (IST)','Action','Department','Admin','Admin Email','Contact','Before','After'])
+    for a in admin_audits(dept,start,end):
+        before=json.loads(a.before) if a.before else {}
+        after=json.loads(a.after) if a.after else {}
+        writer.writerow([report_time(a).strftime('%Y-%m-%d %H:%M:%S'),a.action,a.department,a.actor_name,a.actor_email,
+                         (after or before).get('name',''),readable_contact(a.before),readable_contact(a.after)])
+    from flask import Response
+    return Response('\ufeff'+output.getvalue(),mimetype='text/csv; charset=utf-8',headers={'Content-Disposition':f'attachment; filename="directory-changes-{month or "all"}.csv"'})
+
+def send_monthly_report(month):
+    """Run from monthly_report.py (cron/launchd), not from Flask's dev server."""
+    start,end=month_range(month)
+    if datetime.now(timezone.utc).replace(tzinfo=None)<end:
+        raise ValueError('Monthly report can only be sent after the month ends')
+    existing=db.session.get(MonthlyReportDelivery,month)
+    if existing and existing.status=='sent':return 'already_sent'
+    sender=os.getenv('SMTP_USER','').strip()
+    password=os.getenv('SMTP_APP_PASSWORD','').replace(' ','').strip()
+    recipients=sorted({u.email.strip() for u in User.query.filter_by(role='super_admin',active=True).all() if u.email})
+    if not sender or not password or not recipients:raise RuntimeError('SMTP credentials or active super-admin recipients missing')
+    rows=admin_audits(None,start,end)
+    summary=summarise(rows)
+    t=summary['totals']
+    lines=[f'TSF TELEPHONE DIRECTORY — MONTHLY ADMIN CHANGE REPORT',f'Month: {month}',
+           'Time zone: Asia/Kolkata (IST)','',f'Total changes: {t["total"]}',
+           f'Additions: {t["additions"]}',f'Updates: {t["updates"]}',f'Deletions: {t["deletions"]}','']
+    for title,key in [('Department breakdown','department'),('Admin breakdown','admin'),('Daily breakdown','day')]:
+        lines.extend([title,'-'*len(title)])
+        for g in summary['groups'][key]:
+            lines.append(f'{g["label"]}: Added {g["additions"]} | Updated {g["updates"]} | Deleted {g["deletions"]} | Total {g["total"]}')
+        if not summary['groups'][key]:lines.append('No changes')
+        lines.append('')
+    lines.extend(['INDIVIDUAL CHANGE LOG','---------------------'])
+    for a in rows:
+        lines.extend([f'Date (IST): {report_time(a).strftime("%Y-%m-%d %H:%M:%S")}',
+                      f'Action: {a.action.title()}',f'Admin: {a.actor_name}',f'Admin Email: {a.actor_email}',
+                      f'Department: {a.department}','Before:',readable_contact(a.before),'After:',readable_contact(a.after),''])
+    if not rows:lines.append('No department-admin changes during this month.')
+    msg=EmailMessage();msg['From']=sender;msg['To']=', '.join(recipients)
+    msg['Subject']=f'TSF Telephone Directory | Monthly Admin Change Report | {month}'
+    msg.set_content('\n'.join(lines))
+    with smtplib.SMTP('smtp.gmail.com',587,timeout=30) as smtp:
+        smtp.ehlo();smtp.starttls(context=ssl.create_default_context());smtp.ehlo()
+        smtp.login(sender,password);smtp.send_message(msg)
+    entry=existing or MonthlyReportDelivery(month=month)
+    entry.status='sent';entry.sent_at=datetime.now(timezone.utc).replace(tzinfo=None)
+    entry.recipients=', '.join(recipients)
+    db.session.add(entry);db.session.commit()
+    return 'sent'
+
+@app.get('/api/reports/monthly-status')
+@auth('super_admin')
+def monthly_report_status(user):
+    rows=MonthlyReportDelivery.query.order_by(MonthlyReportDelivery.month.desc()).limit(24).all()
+    return jsonify([{'month':r.month,'status':r.status,'sent_at':r.sent_at.isoformat() if r.sent_at else None,'recipients':r.recipients} for r in rows])
+
 with app.app_context():
+ # Safe, additive migration for existing installations; keeps historical records.
+ from sqlalchemy import inspect, text
  db.create_all()
+ columns={c['name'] for c in inspect(db.engine).get_columns('audit')}
+ if 'actor_role' not in columns:
+  with db.engine.begin() as connection:
+   connection.execute(text('ALTER TABLE audit ADD COLUMN actor_role VARCHAR(20)'))
+   connection.execute(text("UPDATE audit SET actor_role = (SELECT role FROM user WHERE user.id = audit.actor_id) WHERE actor_role IS NULL"))
+
  if not User.query.filter_by(role='super_admin').first():
   email=os.getenv('INITIAL_ADMIN_EMAIL');password=os.getenv('INITIAL_ADMIN_PASSWORD')
   if email and password and len(password)>=10:
