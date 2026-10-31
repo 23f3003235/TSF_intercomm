@@ -106,7 +106,7 @@ const defaultTexts = {
   "ui_099": "INTERNAL COMMUNICATIONS",
   "ui_100": "Corporate Telephone Directory · v1.0",
   "placeholder_101": "Employee name",
-  "placeholder_102": "e.g. 2401",
+  "placeholder_102": "e.g. 6888",
   "placeholder_103": "https://...",
   "ui_104": "Edit contact",
   "ui_105": "Add new contact",
